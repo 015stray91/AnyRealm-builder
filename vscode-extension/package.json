@@ -7,7 +7,15 @@
     "vscode": "^1.60.0"
   },
   "activationEvents": [
-    "onView:anyrealm-architect"
+    "onView:anyrealm-architect",
+    "onView:anyrealm-image-kitchen",
+    "onView:anyrealm-aosp-architect",
+    "onView:anyrealm-debos-builder",
+    "onView:anyrealm-super-partition",
+    "onView:anyrealm-nethunter",
+    "onView:anyrealm-verification",
+    "onView:anyrealm-firmware-decomposer",
+    "onView:anyrealm-gki-manager"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -25,6 +33,38 @@
         {
           "id": "anyrealm-architect",
           "name": "ROM Architect Dashboard"
+        },
+        {
+          "id": "anyrealm-image-kitchen",
+          "name": "Android Image Kitchen"
+        },
+        {
+          "id": "anyrealm-aosp-architect",
+          "name": "AOSP Architect"
+        },
+        {
+          "id": "anyrealm-debos-builder",
+          "name": "Debos Rootfs Builder"
+        },
+        {
+          "id": "anyrealm-super-partition",
+          "name": "Super Partition Studio"
+        },
+        {
+          "id": "anyrealm-nethunter",
+          "name": "NetHunter System Integrator"
+        },
+        {
+          "id": "anyrealm-verification",
+          "name": "Verification & Safety Cockpit"
+        },
+        {
+          "id": "anyrealm-firmware-decomposer",
+          "name": "Firmware Decomposer"
+        },
+        {
+          "id": "anyrealm-gki-manager",
+          "name": "GKI Version Manager"
         }
       ]
     }
