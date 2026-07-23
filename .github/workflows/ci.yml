@@ -23,18 +23,23 @@ jobs:
     - name: Install System Dependencies for Native Modules
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential libkrb5-dev python3
+        sudo apt-get install -y build-essential libkrb5-dev python3 pkg-config libsecret-1-dev
+
+    - name: Configure NPM Environment & Clear Cache
+      run: |
+        npm config set fetch-retry-maxtimeout 600000
+        npm cache clean --force
 
     - name: Install Root Dependencies & Build Web App
       run: |
-        npm install
-        npm run build
+        npm install --legacy-peer-deps --no-audit --prefer-offline
+        npm run build --if-present
 
     - name: Install & Compile VS Code Extension
       run: |
         cd vscode-extension
-        npm install
-        npm run compile
+        npm install --legacy-peer-deps --no-audit --prefer-offline
+        npm run compile --if-present
 
     - name: Upload Web App Build Artifact
       uses: actions/upload-artifact@v4
