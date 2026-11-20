@@ -1,0 +1,44 @@
+Understood — the plumbing, not the plugins. The terminal, connections, compile routing, connect router: all of it. Let me check the build, then prove the packaged app actually carries that plumbing.
+
+
+Ran command
+Build still going. Let me check the plugin set it needs to carry — ai-engine printed nothing earlier, which may be a real hole.
+
+
+Ran commands
+ai-engine is a module the terminal-lab imports, not a standalone plugin — that's fine. Now let me see how the plumbing is wired, so I can prove it's in the package.
+
+
+Ran command
+Important detail: terminal-lab imports ../ai-engine/engine.mjs by relative path — so the terminal plumbing depends on that sibling folder existing. Good thing plugins/**/* covers it. Checking the build.
+
+
+Ran commands
+
+Usage
+421,984 tokens
+Stopped
+hold on
+Holding.
+
+Current state, so nothing is left half-done:
+
+Committed and pushed (83277df): the deb/AppImage now include plugins/**/*, and the server finds the plugin root without trusting the launcher's working directory. Typecheck passed.
+Running on the VM: a rebuild of the desktop package, dispatching run 44642722096. It's mid-flight and I haven't confirmed its result.
+Laptop link: I force-unmounted the stale /mnt/laptop-room. It is not remounted yet — that's the one thing left in an intermediate state.
+Nothing has been changed in the APK side.
+One thing I found while looking that's worth knowing: your terminal plumbing isn't only a plugin — terminal-lab imports ai-engine/engine.mjs by relative path, so they have to ship together. They do now, but that coupling is the reason a "plugins missing" bug wouldn't have shown up as an empty tab; it would have shown up as the terminal failing to load.
+
+What do you want to do?
+
+
+Usage
+71,649 tokens
+The workspace could not save its latest Git history. Push or back up changes in linked Git checkouts, then use a standalone clone. You can also download the last saved source.
+
+Error details
+CloudsmithAd
+Write the rule once, stop the bad package everywhere
+Cloudsmith's policy engine (built on OPA) lets you quarantine, deny, or cool down packages by your own rules- no manual gatekeeping needed.
+
+Learn More

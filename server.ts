@@ -1,1019 +1,342 @@
 import express from "express";
 import path from "path";
-import dotenv from "dotenv";
-import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import { GoogleGenAI, Type } from "@google/genai";
+import dotenv from "dotenv";
+import { WebSocketServer, WebSocket } from "ws";
 
 dotenv.config();
 
 const app = express();
+app.use(express.json({ limit: "20mb" }));
+
 const PORT = 3000;
 
-app.use(express.json());
-
-// Initialize Gemini SDK with telemetry and standard API Key configuration
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      "User-Agent": "aistudio-build",
-    },
-  },
-});
-
-// High-fidelity fallback generator for AOSP custom components when Gemini API is rate-limited or unavailable
-function generateComponentFallback(
-  componentName: string,
-  componentType: string,
-  layer: string,
-  description: string,
-  aidlMethods: any[],
-  connectedComponents: any[]
-) {
-  const cleanName = componentName.replace(/[^a-zA-Z0-9]/g, "");
-  const lowerName = cleanName.toLowerCase();
-  
-  const methodsStr = Array.isArray(aidlMethods) && aidlMethods.length > 0 
-    ? aidlMethods.map((m: any) => {
-        const mStr = typeof m === 'string' ? m : (m.signature || m.name || "");
-        return mStr.endsWith(';') ? `    ${mStr}` : `    ${mStr};`;
-      }).join("\n")
-    : `    void initialize();\n    boolean isAvailable();\n    int getStatus();`;
-
-  const files = [];
-
-  // 1. AIDL Interface
-  files.push({
-    filename: `I${cleanName}.aidl`,
-    path: `frameworks/base/core/java/android/os/I${cleanName}.aidl`,
-    language: "aidl",
-    content: `/*
- * Copyright (C) 2026 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-package android.os;
-
-/**
- * AIDL Interface for ${cleanName} platform service.
- * Role: ${componentType}
- * Description: ${description}
- */
-interface I${cleanName} {
-${methodsStr}
-}`
-  });
-
-  // 2. Core Implementation based on Layer / Type
-  if (layer.toLowerCase().includes("framework") || layer.toLowerCase().includes("app") || componentType.toLowerCase().includes("java") || componentType.toLowerCase().includes("service")) {
-    const javaMethodsImpl = Array.isArray(aidlMethods) && aidlMethods.length > 0
-      ? aidlMethods.map((m: any) => {
-          const mStr = typeof m === 'string' ? m : (m.signature || m.name || "");
-          let retType = "void";
-          if (mStr.includes("boolean")) retType = "boolean";
-          else if (mStr.includes("int")) retType = "int";
-          else if (mStr.includes("String")) retType = "String";
-          
-          const cleanSig = mStr.replace(/;/g, "").trim();
-          return `    @Override\n    public ${cleanSig} throws android.os.RemoteException {\n        android.util.Slog.d(TAG, "Invoked ${cleanSig.split('(')[0]}");\n        ${retType === "boolean" ? "return true;" : retType === "int" ? "return 0;" : retType === "String" ? "return null;" : "return;"}\n    }`;
-        }).join("\n\n")
-      : `    @Override\n    public void initialize() throws android.os.RemoteException {\n        android.util.Slog.i(TAG, "Service initialization routine triggered.");\n    }\n\n    @Override\n    public boolean isAvailable() throws android.os.RemoteException {\n        return true;\n    }\n\n    @Override\n    public int getStatus() throws android.os.RemoteException {\n        return 1; // STATUS_ACTIVE\n    }`;
-
-    files.push({
-      filename: `${cleanName}Service.java`,
-      path: `frameworks/base/services/core/java/com/android/server/${lowerName}/${cleanName}Service.java`,
-      language: "java",
-      content: `/*
- * Copyright (C) 2026 The Android Open Source Project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-package com.android.server.${lowerName};
-
-import android.content.Context;
-import android.os.Binder;
-import android.os.I${cleanName};
-import android.util.Slog;
-
-/**
- * System Service implementation for ${cleanName}.
- * Automatically registered via SystemServer.java.
- */
-public final class ${cleanName}Service extends I${cleanName}.Stub {
-    private static final String TAG = "${cleanName}Service";
-    private final Context mContext;
-
-    public ${cleanName}Service(Context context) {
-        mContext = context;
-        Slog.i(TAG, "Lifecycle initialized: " + TAG);
-    }
-
-${javaMethodsImpl}
-}`
+// Initialize Gemini SDK with named parameters & safe error margins.
+let ai: GoogleGenAI | null = null;
+try {
+  if (process.env.GEMINI_API_KEY) {
+    ai = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
     });
-
-    files.push({
-      filename: "Android.bp",
-      path: `frameworks/base/services/core/java/com/android/server/${lowerName}/Android.bp`,
-      language: "makefile",
-      content: `// Build rules for AOSP ${cleanName} Service
-java_library {
-    name: "services.${lowerName}",
-    srcs: [
-        "**/*.java",
-        "../../../../../../core/java/android/os/I${cleanName}.aidl",
-    ],
-    libs: [
-        "services.core",
-        "android.hardware.power-V1-java",
-    ],
-    static_libs: [
-        "modules-utils-os",
-    ],
-}`
-    });
-
   } else {
-    files.push({
-      filename: `${cleanName}.h`,
-      path: `hardware/interfaces/${lowerName}/1.0/default/${cleanName}.h`,
-      language: "cpp",
-      content: `/*
- * Copyright (C) 2026 The Android Open Source Project
- */
+    console.warn("GEMINI_API_KEY is not defined in the environment.");
+  }
+} catch (error) {
+  console.error("Failed to initialize GoogleGenAI:", error);
+}
 
-#pragma once
+// ----------------- Real-time Workspace State in Memory -----------------
+let activeProjectTemplateId = "react-dashboard";
 
-#include <android/os/I${cleanName}.h>
-#include <binder/BinderService.h>
+// Termux Mobile Emulator Simulator State variables
+let termuxPackages = ["bash", "coreutils", "termux-exec", "apt", "termux-api", "shizuku-api"];
+let termuxRoot = false;
+let termuxStorage = false;
+let termuxTheme = "dracula";
+let termuxFont = "JetBrains Mono";
+let termuxShizukuActive = true;
+let termuxRishActive = false;
 
-namespace android {
-namespace os {
-
-class ${cleanName} : public BinderService<${cleanName}>, public Bn${cleanName} {
-public:
-    static const char* getServiceName() { return "android.os.I${cleanName}"; }
-    
-    ${cleanName}() = default;
-    virtual ~${cleanName}() = default;
-
-    // Interface overrides
-    android::binder::Status initialize() override;
-    android::binder::Status isAvailable(bool* _aidl_return) override;
-    android::binder::Status getStatus(int32_t* _aidl_return) override;
+let globalFiles: any[] = [
+  {
+    id: "index-html",
+    path: "index.html",
+    type: "file" as const,
+    content: `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zenith Cloud Analytics</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body class="bg-[#0b0f14] text-gray-100 min-h-screen">
+    <div id="app"></div>
+    <script src="app.js"></script>
+</body>
+</html>`
+  },
+  {
+    id: "app-js",
+    path: "app.js",
+    type: "file" as const,
+    content: `// Zenith Cloud Operations Engine
+const state = {
+  users: 24890,
+  growth: 14.8,
+  revenue: 124500,
+  activeNow: 412,
+  metrics: [
+    { label: "Mon", value: 3200 },
+    { label: "Tue", value: 4100 },
+    { label: "Wed", value: 3900 },
+    { label: "Thu", value: 5200 },
+    { label: "Fri", value: 6500 },
+    { label: "Sat", value: 4800 },
+    { label: "Sun", value: 5900 }
+  ]
 };
 
-} // namespace os
-} // namespace android`
-    });
+function renderDashboard() {
+  const container = document.getElementById('app');
+  if (!container) return;
 
-    files.push({
-      filename: `${cleanName}.cpp`,
-      path: `hardware/interfaces/${lowerName}/1.0/default/${cleanName}.cpp`,
-      language: "cpp",
-      content: `/*
- * Copyright (C) 2026 The Android Open Source Project
- */
+  container.innerHTML = \`
+    <div class="max-w-4xl mx-auto px-6 py-8">
+      <div class="flex items-center justify-between mb-8 pb-6 border-b border-gray-800">
+        <div>
+          <h1 class="text-2xl font-semibold text-white tracking-tight flex items-center gap-2">
+            <span class="text-cyan-400 font-black">⚙</span> Zenith Cloud Analytics
+          </h1>
+          <p class="text-sm text-gray-400 mt-1">Real-time collaborative analytics cluster.</p>
+        </div>
+        <div>
+          <span class="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-semibold">
+            <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-ping"></span> Live Node
+          </span>
+        </div>
+      </div>
 
-#define LOG_TAG "${cleanName}"
-#include <log/log.h>
-#include "${cleanName}.h"
+      <div class="grid grid-cols-3 gap-6 mb-8">
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+          <span class="text-xs font-medium text-gray-400 uppercase tracking-wider block mb-2">Users</span>
+          <h3 class="text-3xl font-bold text-white">\${state.users.toLocaleString()}</h3>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+          <span class="text-xs font-medium text-gray-400 uppercase tracking-wider block mb-2">Revenue</span>
+          <h3 class="text-3xl font-bold text-white">$\${state.revenue.toLocaleString()}</h3>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+          <span class="text-xs font-medium text-gray-400 uppercase tracking-wider block mb-2">Active Sessions</span>
+          <h3 class="text-3xl font-bold text-cyan-400 animate-pulse">\${state.activeNow}</h3>
+        </div>
+      </div>
 
-namespace android {
-namespace os {
-
-android::binder::Status ${cleanName}::initialize() {
-    ALOGI("Initializing local ${cleanName} hardware layer service");
-    return android::binder::Status::ok();
+      <div class="bg-gray-900 border border-gray-800 rounded-xl p-6">
+        <h3 class="text-base font-semibold text-white mb-6">Traffic (Past Week)</h3>
+        <div class="flex items-end gap-3 h-48 pt-4">
+          \${state.metrics.map(d => {
+            const heightPercent = Math.round((d.value / 7000) * 100);
+            return \`
+              <div class="flex-1 flex flex-col items-center gap-2">
+                <div class="w-full bg-[#00D1FF]/20 hover:bg-[#00D1FF]/30 rounded-md transition-all flex flex-col justify-end" style="height: \${heightPercent}%">
+                  <div class="w-full bg-gradient-to-t from-[#0055FF] to-[#00D1FF] rounded-md min-h-[4px]" style="height: 50%"></div>
+                </div>
+                <span class="text-xs text-gray-500 font-mono">\${d.label}</span>
+              </div>
+            \`;
+          }).join('')}
+        </div>
+      </div>
+    </div>
+  \`;
 }
 
-android::binder::Status ${cleanName}::isAvailable(bool* _aidl_return) {
-    *_aidl_return = true;
-    return android::binder::Status::ok();
-}
-
-android::binder::Status ${cleanName}::getStatus(int32_t* _aidl_return) {
-    *_aidl_return = 1; // ACTIVE
-    return android::binder::Status::ok();
-}
-
-} // namespace os
-} // namespace android`
-    });
-
-    files.push({
-      filename: "Android.bp",
-      path: `hardware/interfaces/${lowerName}/1.0/default/Android.bp`,
-      language: "makefile",
-      content: `cc_binary {
-    name: "android.hardware.${lowerName}@1.0-service",
-    relative_install_path: "hw",
-    init_rc: ["android.hardware.${lowerName}@1.0-service.rc"],
-    vintf_fragments: ["android.hardware.${lowerName}@1.0-service.xml"],
-    srcs: [
-        "${cleanName}.cpp",
-        "service.cpp",
-    ],
-    shared_libs: [
-        "libbinder",
-        "libutils",
-        "libcutils",
-        "liblog",
-        "android.hardware.${lowerName}@1.0",
-    ],
-    cflags: [
-        "-Wall",
-        "-Werror",
-    ],
-}`
-    });
+window.addEventListener('DOMContentLoaded', renderDashboard);
+renderDashboard();`
   }
+];
 
-  // SELinux policy
-  files.push({
-    filename: `${lowerName}.te`,
-    path: `system/sepolicy/public/${lowerName}.te`,
-    language: "properties",
-    content: `# SELinux domain definition for ${cleanName} Service
-type ${lowerName}, domain;
-type ${lowerName}_exec, exec_type, file_type, system_file_type;
+// Instantiating collaborative Git database in active memory
+let gitState = {
+  isInitialized: false,
+  currentBranch: "main",
+  branches: ["main"],
+  commits: [] as any[],
+  staged: {} as { [path: string]: string },
+  stash: [] as any[],
+  remotes: ["origin  https://github.com/windsurf/collaborative-app.git"]
+};
 
-# Binder interface declarations
-typeattribute ${lowerName} binder_in_vendor_violators;
-
-# Allow access to binder system server calls
-binder_use(${lowerName})
-binder_call(${lowerName}, system_server)
-binder_call(system_server, ${lowerName})
-
-# Grant capability to find service in service_manager
-allow system_server ${lowerName}_service:service_manager find;
-allow ${lowerName} ${lowerName}_service:service_manager add;
-
-# Write logs to logcat
-allow ${lowerName} logcat_device:chr_file { read write };
-`
-  });
-
-  // AOSP Integration Guide
-  files.push({
-    filename: "AOSP_INTEGRATION_GUIDE.md",
-    path: `frameworks/base/services/core/java/com/android/server/${lowerName}/AOSP_INTEGRATION_GUIDE.md`,
-    language: "markdown",
-    content: `# AOSP Platform Integration Guide: ${cleanName}
-
-This component has been dynamically synthesized with optimized offline fallbacks. Follow these steps to register and build the service in your custom AOSP tree.
-
-## 1. Directory Tree Placement
-Move files into the following directories relative to your AOSP root:
-- \`I${cleanName}.aidl\` -> \`frameworks/base/core/java/android/os/\`
-- \`Android.bp\` / Implementation file -> \`frameworks/base/services/core/java/com/android/server/${lowerName}/\`
-- \`${lowerName}.te\` -> \`system/sepolicy/public/\`
-
-## 2. Registering in Service Manager
-Add the following line to \`system/sepolicy/private/service_contexts\`:
-\`\`\`plaintext
-android.os.I${cleanName}                   u:object_r:${lowerName}_service:s0
-\`\`\`
-
-## 3. Launch & SystemServer hook
-Open \`frameworks/base/services/java/com/android/server/SystemServer.java\`, import your package and start the service in the relevant boot phase (usually \`startOtherServices\`):
-\`\`\`java
-try {
-    Slog.i(TAG, "Starting Custom ${cleanName} Service");
-    ServiceManager.addService("android.os.I${cleanName}", new com.android.server.${lowerName}.${cleanName}Service(context));
-} catch (Throwable e) {
-    reportWtf("starting ${cleanName} Service", e);
-}
-\`\`\`
-
-## 4. Build Commands
-Run the target command from root:
-\`\`\`bash
-source build/envsetup.sh
-lunch aosp_arm64-eng
-m -j\$(nproc) services.core
-\`\`\`
-`
-  });
-
-  return { files, offlineFallback: true };
-}
-
-// High-fidelity fallback generator for hybrid rootfs fuser scripts when Gemini API is rate-limited or unavailable
-function generateFusionFallback(
-  distroName: string,
-  distroVersion: string,
-  partitionScheme: string,
-  displayServer: string,
-  inputRouting: string,
-  audioRouting: string,
-  directories: any[],
-  integrations: any
-) {
-  const files = [];
-
-  files.push({
-    filename: "fuse_rootfs.sh",
-    language: "bash",
-    content: `#!/bin/bash
-# ==============================================================================
-#  AOSP - Hybrid Linux RootFS Fusion Compiler Script
-#  Target: ${distroName} (${distroVersion})
-#  Boot Partition Scheme: ${partitionScheme}
-#  Automatically generated by AOSP RootFS Fuser Offline Engine
-# ==============================================================================
-
-set -e
-
-WORKSPACE_ROOT="./fusion_workspace"
-ANDROID_OUT="./out/target/product/generic/system"
-ROOTFS_TAR="./rootfs_${distroName.toLowerCase()}_${distroVersion}.tar.gz"
-
-echo "[+] Initializing Fusion compilation workspace..."
-mkdir -p "\${WORKSPACE_ROOT}/ubuntu_rootfs"
-mkdir -p "\${ANDROID_OUT}/hybrid_linux"
-
-echo "[+] Mapping system root mount directories..."
-# Processing directory porting rules: ${JSON.stringify(directories || [])}
-${
-  Array.isArray(directories) && directories.length > 0
-    ? directories.map((d: any) => `echo "  -> Copying ${d.name || d} with mode ${d.rule || 'fuse'}"\ncp -a "\${WORKSPACE_ROOT}/ubuntu_rootfs/${d.name || d}/." "\${ANDROID_OUT}/${d.name || d}"`).join("\n")
-    : `echo "  -> Default Bind: copying core rootfs binaries to /system/linux..."
-cp -a "\${WORKSPACE_ROOT}/ubuntu_rootfs/usr/." "\${ANDROID_OUT}/linux_usr/"`
-}
-
-echo "[+] Injecting dynamic library links and compatibility bindings..."
-# Dynamic Loader redirection
-ln -sf /system/lib64/bootstrap/libc.so "\${ANDROID_OUT}/hybrid_linux/lib/libc.so"
-
-echo "[+] Configuring Graphics Interface: ${displayServer}..."
-cat << 'EOF' > "\${ANDROID_OUT}/etc/hybrid_graphics.conf"
-# Hybrid Display setup for ${displayServer}
-DISPLAY_SERVER_TYPE=${displayServer.toUpperCase()}
-INPUT_EVENT_ROUTING=${inputRouting}
-AUDIO_OUTPUT_TUNING=${audioRouting}
-EOF
-
-echo "[+] Success! Hybrid Rootfs successfully compiled."
-`
-  });
-
-  files.push({
-    filename: "chroot_init.rc",
-    language: "properties",
-    content: `# Init.rc config for hybrid ${distroName} chroot lifecycle
-# Boot triggers for initializing rootfs mount and namespaces
-
-on post-fs-data
-    # Prepare secure container mount points
-    mkdir /data/hybrid_linux 0755 root system
-    mkdir /data/hybrid_linux/proc 0755 root system
-    mkdir /data/hybrid_linux/sys 0755 root system
-    mkdir /data/hybrid_linux/dev 0755 root system
-
-# Mount Linux container points
-on boot
-    mount proc /data/hybrid_linux/proc /data/hybrid_linux/proc bind
-    mount sysfs /data/hybrid_linux/sys /data/hybrid_linux/sys bind
-    mount tmpfs /data/hybrid_linux/dev /data/hybrid_linux/dev bind
-
-# Launch main background daemon service
-service hybrid_init /system/bin/sh /system/etc/fuse_rootfs.sh --launch
-    class late_start
-    user root
-    group root system audio graphics
-    oneshot
-    seclabel u:r:su:s0
-`
-  });
-
-  const displayConfigName = displayServer.toLowerCase().includes("weston") ? "weston.ini" : "display_config.conf";
-  files.push({
-    filename: displayConfigName,
-    language: "ini",
-    content: `[core]
-# Hybrid display graphics server configuration
-# Display core: ${displayServer}
-backend=drm-backend.so
-shell=desktop-shell.so
-renderer=pixman-renderer.so
-
-[shell]
-locking=false
-background-color=0x00223344
-panel-position=bottom
-
-[output]
-name=LVDS1
-mode=preferred
-transform=normal
-
-[keyboard]
-keymap_layout=${inputRouting.toLowerCase().includes("usb") ? "us" : "evdev"}
-
-[audio]
-# Routed over: ${audioRouting}
-sink=pulseaudio
-`
-  });
-
-  return { files, offlineFallback: true };
-}
-
-// API endpoint to generate custom AOSP component files using Gemini
-app.post("/api/generate-component", async (req, res) => {
-  try {
-    const { componentName, componentType, layer, description, aidlMethods, connectedComponents } = req.body;
-
-    if (!componentName) {
-      return res.status(400).json({ error: "Component Name is required" });
-    }
-
-    const systemPrompt = `You are a Principal AOSP (Android Open Source Project) Architect and Platform Engineer. 
-Your goal is to write professional, highly realistic, and complete Android OS platform code files for a given custom component.
-Follow strict AOSP conventions for coding standards, directories, and build systems.`;
-
-    const prompt = `Generate complete AOSP source and configuration files for a new custom component in the Android Open Source Project (AOSP) tree.
-Here are the specifications:
-- **Component Name**: "${componentName}" (e.g. if it is a service, you might name classes "${componentName}Service" or interfaces "I${componentName}")
-- **AOSP Layer**: "${layer}" (e.g. Apps, Framework Services, Native Daemons, HAL, Kernel)
-- **Role/Type**: "${componentType}"
-- **Description**: "${description}"
-- **AIDL Methods (if applicable)**: ${JSON.stringify(aidlMethods || [])}
-- **Connected Components/Dependencies**: ${JSON.stringify(connectedComponents || [])}
-
-Based on this layer and specifications, please generate a complete suite of files. You must generate:
-1. **The Core Source Code**:
-   - If Framework Services or Apps: A Java system service class (extending IBinder.Stub or SystemService) or Application controller.
-   - If Native/HAL: A C++ class implementation (.h and .cpp) implementing the AIDL or HIDL HAL interfaces.
-2. **The AIDL Interface File (if IPC is involved)**:
-   - A complete '.aidl' file with package, interface definition, and methods.
-3. **Build Blueprint (Android.bp)**:
-   - Complete bp build rule (cc_library_shared, android_app, or java_library) with correct source lists and dependencies (libbinder, libcutils, libutils, etc.).
-4. **SELinux Policy File (.te)**:
-   - Complete type definitions, service attributes, and 'allow' lines (e.g. allow system_server or app domain to associate or call this binder service).
-5. **AOSP Integration Guide**:
-   - Short markdown guide explaining where in the AOSP folder tree to place these files (e.g. /frameworks/base/core/java, /hardware/interfaces/, etc.) and how to register it in 'service_contexts' or 'init.rc'.
-
-Format the response strictly in JSON matching the following schema. Return ONLY valid JSON:
-{
-  "files": [
-    {
-      "filename": "string (e.g. ICustomService.aidl)",
-      "path": "string (e.g. frameworks/base/core/java/android/os/ICustomService.aidl)",
-      "language": "string (e.g. aidl, java, cpp, rust, makefile, dts)",
-      "content": "string (complete code with actual realistic logic and appropriate imports, comments, license headers)"
-    }
-  ]
-}`;
-
-    let data;
-    try {
-      const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: prompt,
-        config: {
-          systemInstruction: systemPrompt,
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            required: ["files"],
-            properties: {
-              files: {
-                type: Type.ARRAY,
-                description: "List of AOSP source and configuration files to build this component.",
-                items: {
-                  type: Type.OBJECT,
-                  required: ["filename", "path", "language", "content"],
-                  properties: {
-                    filename: { type: Type.STRING },
-                    path: { type: Type.STRING },
-                    language: { type: Type.STRING },
-                    content: { type: Type.STRING }
-                  }
-                }
-              }
-            }
-          }
-        }
-      });
-
-      const resultText = response.text || "{}";
-      data = JSON.parse(resultText);
-    } catch (apiError: any) {
-      console.warn("Gemini API call failed, using high-fidelity offline fallback:", apiError.message || apiError);
-      data = generateComponentFallback(
-        componentName,
-        componentType,
-        layer,
-        description,
-        aidlMethods || [],
-        connectedComponents || []
-      );
-    }
-    res.json(data);
-  } catch (error: any) {
-    console.error("Gemini Code Generation Error:", error);
-    res.status(500).json({ error: error.message || "Failed to generate AOSP components." });
+// System terminal stream history
+let terminalCommands: any[] = [
+  {
+    id: "init",
+    input: "system --status",
+    output: "Windsurf Engine version 1.4.2 [ACTIVE]\nSync network initialized over collaborative Secure WebSockets.\nReady.",
+    directory: "~",
+    timestamp: new Date().toLocaleTimeString()
   }
-});
+];
 
-
-// Toolchain Registry & Command Injection
-app.post("/api/commands/generate", (req, res) => {
-  const { tool, params } = req.body;
-  // Dynamic command wrapper logic
-  let command = "";
-  if (tool === "lpmake") {
-    command = `lpmake --metadata-size ${params.metadataSize || 9126809600} --super-name ${params.superName || 'super'} --metadata-slots ${params.slots || 2} --partition ${params.partition || 'system:readonly'}`;
-  } else if (tool === "unpackbootimg") {
-    command = `unpackbootimg -i ${params.image || 'boot.img'} -o ${params.output || './out'}`;
-  }
-  res.json({ command });
-});
-
-// Cloud Compilation Handlers
-app.post("/api/cloud/build", (req, res) => {
-  const { provider, repository, taskType } = req.body;
-  // Trigger GitHub/GitLab workflow
-  res.json({ success: true, message: `Triggered ${taskType} build on ${provider} for ${repository}` });
-});
-
-// Device Tree Parser Handler
-app.post("/api/dtc/parse", (req, res) => {
-  const { dtsContent } = req.body;
-  // Parse DTS content and return structured map
-  res.json({ tree: { node: "root", properties: { clock: "1.2GHz" } } });
-});
-
-// Sudo Elevation Simulation
-app.post("/api/sudo/execute", (req, res) => {
-  const { command } = req.body;
-  // Security Note: Actual sudo is not executable in container.
-  console.log(`[SECURE] Sudo command initiated (Admin context): ${command}`);
-  res.json({ 
-    success: true, 
-    message: "Command queued for execution in privileged container context.",
-    output: `[root@anyrealm]# ${command}\n[OK] Privilege elevation successful.` 
-  });
-});
-
-// Secure Cloud Pipeline Dispatcher
-app.post("/api/cloud/dispatch", async (req, res) => {
-  const { provider, repository, taskType } = req.body;
-  const token = provider === 'github' ? process.env.GITHUB_CLIENT_SECRET : process.env.GITLAB_CLIENT_SECRET;
-  
-  // Log masking
-  const maskedToken = token ? '********' : 'NULL_TOKEN';
-  const logTrace = `Triggered ${taskType} build on ${provider} for ${repository}. Auth: Bearer ${maskedToken}`;
-  
-  console.log(`[CLOUD] ${logTrace}`);
-  
-  // Simulate API interaction
-  res.json({ success: true, log: logTrace });
-});
-
-
-// Connected profiles in-memory session database
-interface OAuthProfile {
-  connected: boolean;
-  username: string;
-  avatarUrl: string;
-  email: string;
-  isDemo: boolean;
-}
-
-const connectedProfiles: Record<string, OAuthProfile> = {};
-
-// Get authorized developer profile state
-app.get("/api/auth/profile", (req, res) => {
-  res.json({
-    profiles: {
-      github: connectedProfiles.github || null,
-      gitlab: connectedProfiles.gitlab || null,
-      google: connectedProfiles.google || null
-    }
-  });
-});
-
-// Build OAuth URL for the targeted provider
-app.get("/api/auth/url", (req, res) => {
-  const { provider, redirect_uri } = req.query;
-  if (!provider) {
-    return res.status(400).json({ error: "Provider is required" });
-  }
-
-  let authUrl = "";
-  if (provider === "github") {
-    const clientId = process.env.GITHUB_CLIENT_ID;
-    if (clientId) {
-      const params = new URLSearchParams({
-        client_id: clientId,
-        redirect_uri: redirect_uri as string,
-        scope: "repo user",
-        state: "github_oauth_state_secret_123"
-      });
-      authUrl = `https://github.com/login/oauth/authorize?${params.toString()}`;
-    } else {
-      // Setup-friendly developer simulation fallback if key is unconfigured
-      const params = new URLSearchParams({
-        simulation: "true",
-        provider: "github",
-        redirect_uri: redirect_uri as string
-      });
-      authUrl = `${redirect_uri}?${params.toString()}`;
-    }
-  } else if (provider === "gitlab") {
-    const clientId = process.env.GITLAB_CLIENT_ID;
-    if (clientId) {
-      const params = new URLSearchParams({
-        client_id: clientId,
-        redirect_uri: redirect_uri as string,
-        response_type: "code",
-        scope: "api read_user",
-        state: "gitlab_oauth_state_secret_123"
-      });
-      authUrl = `https://gitlab.com/oauth/authorize?${params.toString()}`;
-    } else {
-      const params = new URLSearchParams({
-        simulation: "true",
-        provider: "gitlab",
-        redirect_uri: redirect_uri as string
-      });
-      authUrl = `${redirect_uri}?${params.toString()}`;
-    }
-  } else if (provider === "google") {
-    const clientId = process.env.GOOGLE_CLIENT_ID;
-    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-    const isValidGoogle = clientId && clientId.includes(".apps.googleusercontent.com") && clientSecret;
-    if (isValidGoogle) {
-      const params = new URLSearchParams({
-        client_id: clientId,
-        redirect_uri: redirect_uri as string,
-        response_type: "code",
-        scope: "openid email profile",
-        state: "google_oauth_state_secret_123"
-      });
-      authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-    } else {
-      const params = new URLSearchParams({
-        simulation: "true",
-        provider: "google",
-        redirect_uri: redirect_uri as string
-      });
-      authUrl = `${redirect_uri}?${params.toString()}`;
-    }
-  }
-
-  res.json({ url: authUrl });
-});
-
-// OAuth Callback handler designed specifically to operate inside the AI Studio iframe window environment
-app.get(["/auth/callback", "/auth/callback/"], async (req, res) => {
-  const { code, state, simulation, provider, redirect_uri } = req.query;
-
-  let finalProvider = (provider as string) || "";
-  let username = "AOSP Developer";
-  let avatarUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150&q=80";
-  let email = "dev@aosp.platform";
-  let isDemo = false;
-
-  if (simulation === "true" || !code) {
-    isDemo = true;
-    if (finalProvider === "github" || (!finalProvider && state === "github_oauth_state_secret_123")) {
-      finalProvider = "github";
-      username = "octocat-aosp";
-      avatarUrl = "https://avatars.githubusercontent.com/u/5832347?v=4";
-      email = "octocat@github.com";
-    } else if (finalProvider === "gitlab" || (!finalProvider && state === "gitlab_oauth_state_secret_123")) {
-      finalProvider = "gitlab";
-      username = "gitlab_aosp_dev";
-      avatarUrl = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?auto=format&fit=crop&w=150&h=150&q=80";
-      email = "gitlab_user@gitlab.com";
-    } else if (finalProvider === "google" || (!finalProvider && state === "google_oauth_state_secret_123")) {
-      finalProvider = "google";
-      username = "AOSP Architect Lead";
-      avatarUrl = "https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?auto=format&fit=crop&w=150&h=150&q=80";
-      email = "architect@google.com";
-    }
-  } else {
-    try {
-      if (state === "github_oauth_state_secret_123") {
-        finalProvider = "github";
-        const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-          },
-          body: JSON.stringify({
-            client_id: process.env.GITHUB_CLIENT_ID,
-            client_secret: process.env.GITHUB_CLIENT_SECRET,
-            code,
-            redirect_uri
-          })
-        });
-        const tokenData = await tokenResponse.json() as any;
-        const accessToken = tokenData.access_token;
-
-        if (accessToken) {
-          const userResponse = await fetch("https://api.github.com/user", {
-            headers: {
-              "Authorization": `Bearer ${accessToken}`,
-              "User-Agent": "aosp-platform-architect"
-            }
-          });
-          const userData = await userResponse.json() as any;
-          username = userData.login || "GitHub Developer";
-          avatarUrl = userData.avatar_url || avatarUrl;
-          email = userData.email || email;
-        } else {
-          isDemo = true;
-        }
-      } else if (state === "gitlab_oauth_state_secret_123") {
-        finalProvider = "gitlab";
-        const tokenResponse = await fetch("https://gitlab.com/oauth/token", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-          },
-          body: JSON.stringify({
-            client_id: process.env.GITLAB_CLIENT_ID,
-            client_secret: process.env.GITLAB_CLIENT_SECRET,
-            code,
-            grant_type: "authorization_code",
-            redirect_uri
-          })
-        });
-        const tokenData = await tokenResponse.json() as any;
-        const accessToken = tokenData.access_token;
-
-        if (accessToken) {
-          const userResponse = await fetch("https://gitlab.com/api/v4/user", {
-            headers: { "Authorization": `Bearer ${accessToken}` }
-          });
-          const userData = await userResponse.json() as any;
-          username = userData.username || "GitLab Developer";
-          avatarUrl = userData.avatar_url || avatarUrl;
-          email = userData.email || email;
-        } else {
-          isDemo = true;
-        }
-      } else if (state === "google_oauth_state_secret_123") {
-        finalProvider = "google";
-        const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            client_id: process.env.GOOGLE_CLIENT_ID,
-            client_secret: process.env.GOOGLE_CLIENT_SECRET,
-            code,
-            grant_type: "authorization_code",
-            redirect_uri
-          })
-        });
-        const tokenData = await tokenResponse.json() as any;
-        const accessToken = tokenData.access_token;
-
-        if (accessToken) {
-          const userResponse = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-            headers: { "Authorization": `Bearer ${accessToken}` }
-          });
-          const userData = await userResponse.json() as any;
-          username = userData.name || "Google Developer";
-          avatarUrl = userData.picture || avatarUrl;
-          email = userData.email || email;
-        } else {
-          isDemo = true;
-        }
-      }
-    } catch (e) {
-      console.error("Token exchange fail, falling back to Sandbox connection for demo:", e);
-      isDemo = true;
-    }
-  }
-
-  connectedProfiles[finalProvider] = {
-    connected: true,
-    username,
-    avatarUrl,
-    email,
-    isDemo
+// Presences list of connected contributors
+interface CollaboratorUser {
+  id: string;
+  name: string;
+  color: string;
+  cursor?: {
+    fileId: string;
+    line: number;
+    ch: number;
   };
+}
 
-  res.send(`
-    <html>
-      <head>
-        <title>Connecting Account...</title>
-        <style>
-          body {
-            background-color: #0b0f19;
-            color: #f1f5f9;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-            margin: 0;
-            text-align: center;
-          }
-          .spinner {
-            border: 4px solid rgba(255, 255, 255, 0.1);
-            width: 36px;
-            height: 36px;
-            border-radius: 50%;
-            border-left-color: #3b82f6;
-            animation: spin 1s linear infinite;
-            margin-bottom: 20px;
-          }
-          @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-          }
-          h2 { font-weight: 700; margin: 0 0 8px 0; }
-          p { color: #94a3b8; font-size: 14px; margin: 0; }
-        </style>
-      </head>
-      <body>
-        <div class="spinner"></div>
-        <h2>Connection Successful!</h2>
-        <p>Syncing details with Android OS Platform Architect...</p>
-        <script>
-          if (window.opener) {
-            window.opener.postMessage({ 
-              type: 'OAUTH_AUTH_SUCCESS', 
-              provider: '${finalProvider}',
-              username: '${username}',
-              avatarUrl: '${avatarUrl}',
-              email: '${email}',
-              isDemo: ${isDemo}
-            }, '*');
-            window.close();
-          } else {
-            window.location.href = '/';
-          }
-        </script>
-      </body>
-    </html>
-  `);
-});
+let activeUsers: { [wsId: string]: CollaboratorUser } = {};
 
-// Revoke auth connection
-app.post("/api/auth/logout", (req, res) => {
-  const { provider } = req.body;
-  if (provider && connectedProfiles[provider]) {
-    delete connectedProfiles[provider];
-  }
-  res.json({ success: true });
-});
+// Helper: Names Generator for Realtime Guests
+const FIRST_NAMES = ["Space", "Quantum", "Nebula", "Cyber", "Delta", "Pixel", "Cosmic", "Async", "Apex", "Nova", "Git"];
+const LAST_NAMES = ["Architect", "Wizard", "Scripter", "Coder", "Dev", "Explorer", "Hacker", "Pilot", "Naut", "Operator"];
+const COLORS = ["#00D1FF", "#A3E635", "#F43F5E", "#FB923C", "#38BDF8", "#EC4899", "#8B5CF6", "#10B981", "#EAB308", "#F472B6"];
 
-// Commit custom build files to connected repositories
-app.post("/api/auth/commit", (req, res) => {
-  const { provider, repository, files, commitMessage } = req.body;
-  
-  if (!provider || !repository || !files || files.length === 0) {
-    return res.status(400).json({ error: "Missing required commit parameters" });
-  }
+function generateRandomUser(id: string): CollaboratorUser {
+  const first = FIRST_NAMES[Math.floor(Math.random() * FIRST_NAMES.length)];
+  const last = LAST_NAMES[Math.floor(Math.random() * LAST_NAMES.length)];
+  const color = COLORS[Math.floor(Math.random() * COLORS.length)];
+  return {
+    id,
+    name: `${first} ${last}`,
+    color
+  };
+}
 
-  const profile = connectedProfiles[provider];
-  if (!profile || !profile.connected) {
-    return res.status(401).json({ error: "Account not authorized" });
-  }
-
-  const logs = [
-    `[*] Connecting to branch 'main' in target repository '${repository}'...`,
-    `[*] Authorizing transaction via secure access token...`,
-    `[*] Checking git workspace and staging files...`,
-    ...files.map((f: any) => `[+] git add "${f.filename}" (${f.path})`),
-    `[*] Writing dynamic index...`,
-    `[*] git commit -m "${commitMessage || 'AOSP System Code Auto-sync'}"`,
-    `[*] Pushing commit branch (SHA-1: ${Math.random().toString(16).substring(2, 10)}${Math.random().toString(16).substring(2, 10)})...`,
-    `[SUCCESS] Pushed all staged files to remote master on ${provider.toUpperCase()} repository.`
-  ];
-
-  res.json({ success: true, logs });
-});
-
-// API endpoint to generate high fidelity rootfs fusion scripts using Gemini
-app.post("/api/generate-fusion-files", async (req, res) => {
+// Cascade/Gemini proxy endpoint keeps fully functional
+app.post("/api/cascade/chat", async (req, res) => {
   try {
-    const { distroName, distroVersion, partitionScheme, displayServer, inputRouting, audioRouting, directories, integrations } = req.body;
+    const { messages, currentFile, mode } = req.body;
 
-    const systemPrompt = `You are an Embedded Linux and AOSP Integration Specialist.
-Your goal is to write custom integration blueprints and shell scripts to fuse a standard Linux distribution rootfs into an AOSP system partition.`;
-
-    const prompt = `Synthesize system configurations and integration shell scripts to fuse a hybrid embedded Linux rootfs inside an AOSP build:
-- **Target Distribution**: "${distroName}" (${distroVersion})
-- **Partition & Boot Scheme**: "${partitionScheme}"
-- **Graphics Display Core**: "${displayServer}"
-- **Input Events**: "${inputRouting}"
-- **Audio Service**: "${audioRouting}"
-- **Mapped Directory Porting Rules**: ${JSON.stringify(directories || [])}
-- **Daemons Enabled**: ${JSON.stringify(integrations || {})}
-
-Based on this setup, please generate:
-1. 'fuse_rootfs.sh': An executable bash fuser script that mounts, parses, copies, or stubs directories based on their rules, establishing symlinks and setting the dynamic library loader paths.
-2. 'chroot_init.rc': An Android init script containing a service that mounts virtual directories (/dev, /sys, /proc), launches the rootfs in a namespace chroot, and triggers essential services.
-3. 'weston.ini' or 'display_config.conf': Graphics configuration setting up appropriate output framebuffers, input bindings, and lease mappings to the display server.
-
-Format the response strictly in JSON matching the following schema. Return ONLY valid JSON:
-{
-  "files": [
-    {
-      "filename": "string (e.g. fuse_rootfs.sh)",
-      "language": "string (e.g. bash, ini, properties)",
-      "content": "string (complete shell script or config file)"
-    }
-  ]
-}`;
-
-    let data;
-    try {
-      const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: prompt,
-        config: {
-          systemInstruction: systemPrompt,
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            required: ["files"],
-            properties: {
-              files: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  required: ["filename", "language", "content"],
-                  properties: {
-                    filename: { type: Type.STRING },
-                    language: { type: Type.STRING },
-                    content: { type: Type.STRING }
-                  }
-                }
-              }
-            }
-          }
-        }
+    if (!ai) {
+      return res.status(503).json({
+        error: "Gemini API client is not configured on the server. Please check your GEMINI_API_KEY secret.",
       });
-
-      const resultText = response.text || "{}";
-      data = JSON.parse(resultText);
-    } catch (apiError: any) {
-      console.warn("Gemini API call failed, using high-fidelity offline fallback:", apiError.message || apiError);
-      data = generateFusionFallback(
-        distroName,
-        distroVersion,
-        partitionScheme,
-        displayServer,
-        inputRouting,
-        audioRouting,
-        directories || [],
-        integrations || {}
-      );
     }
-    res.json(data);
-  } catch (error: any) {
-    console.error("Fuser Code Generation Error:", error);
-    res.status(500).json({ error: error.message || "Failed to generate rootfs fusion script." });
+
+    // Format the current workspace state so Gemini understands what's available
+    const workspaceRepresentation = globalFiles
+      .map((f: any) => `### FILE: ${f.path}\n\`\`\`${f.path.split(".").pop() || ""}\n${f.content}\n\`\`\``)
+      .join("\n\n");
+
+    const recentCommands = terminalCommands.length > 0
+      ? terminalCommands.map((cmd: any) => `$ ${cmd.input}\n${cmd.output}`).slice(-5).join("\n")
+      : "No command history yet.";
+
+    const systemInstruction = `You are Cascade, the advanced AI coding agent integrated into the Windsurf IDE (developed by Codeium).
+Your goal is to help developers create, edit, debug, and understand projects within a collaborative code space.
+
+You operate in two modes:
+1. "chat" (Ask): Answering questions, conceptual explanations, reviews, formatting, or code walk-throughs.
+2. "agent" (Write): Proactively coding, proposing additions, making edits, creating directories, and verifying via terminal.
+
+Current State of virtual workspace:
+${workspaceRepresentation}
+
+Current open file: ${currentFile || "None"}
+Recent Terminal Commands & Outputs:
+${recentCommands}
+
+Current Mode: ${mode || "agent"}
+
+You MUST return a JSON response adhering to the exact schema.
+If in "agent" mode, prefer suggesting edits or creating files to help fulfill the user's instructions.
+- To create a new file or completely overwrite a file, suggest a "create_file" action.
+- To modify specific lines of an existing file, use "edit_file". Ensure "targetLines" contains the EXACT text that already exists in that file, and "replacementLines" contains the new version.
+- To suggest running a terminal command to test, run, or verify, use "run_command" (e.g. "npm run test", "python app.py", "git init", "node index.js").
+- To show a web preview inside the IDE, use "show_preview".
+- Remember that you are simulating a fully functional virtual environment inside a web sandbox. The workspace files can be parsed dynamically, and when a user runs the suggested terminal commands, the web IDE simulator will output custom terminal streams!
+
+Keep explanations highly professional, concise, and focused on visual styling, structure, and execution. No unnecessary preamble.`;
+
+    // Construct request to Gemini
+    const lastUserMessage = messages[messages.length - 1];
+    
+    // Provide a chat context. We will pack previous conversation context into the prompt
+    const chatHistory = messages
+      .slice(0, -1)
+      .map((m: any) => `${m.role === "user" ? "Developer" : "Cascade"}: ${m.text || m.content}`)
+      .join("\n");
+
+    const prompt = `Here is the conversation history:\n${chatHistory}\n\nDeveloper's prompt: ${lastUserMessage.text || lastUserMessage.content}\n\nAnalyze the request based on the workspace, then respond with a JSON object.`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.5-flash",
+      contents: prompt,
+      config: {
+        systemInstruction: systemInstruction,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          required: ["thought", "explanation"],
+          properties: {
+            thought: {
+              type: Type.STRING,
+              description: "Internal thinking process of Cascade, describing what changes are required and why.",
+            },
+            explanation: {
+              type: Type.STRING,
+              description: "Conversational text or Markdown explanation to present to the developer in the chat.",
+            },
+            actions: {
+              type: Type.ARRAY,
+              description: "Optional list of IDE tools that Cascade wants to execute to fulfill the user request.",
+              items: {
+                type: Type.OBJECT,
+                required: ["type", "description"],
+                properties: {
+                  type: {
+                    type: Type.STRING,
+                    description: "The action to take matching ('create_file', 'edit_file', 'run_command', 'show_preview')",
+                  },
+                  path: {
+                    type: Type.STRING,
+                    description: "Target file path (required for 'create_file' or 'edit_file').",
+                  },
+                  content: {
+                    type: Type.STRING,
+                    description: "Entire content of the file for 'create_file'.",
+                  },
+                  targetLines: {
+                    type: Type.STRING,
+                    description: "EXACT lines within the existing file to match for replacements in 'edit_file'. Ensure whitespace and indenting match 100%.",
+                  },
+                  replacementLines: {
+                    type: Type.STRING,
+                    description: "Replacement lines of code to substitute for the target lines in 'edit_file'.",
+                  },
+                  command: {
+                    type: Type.STRING,
+                    description: "The term command to run for 'run_command'.",
+                  },
+                  description: {
+                    type: Type.STRING,
+                    description: "Short human-readable description shown in the tool interface.",
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const parsedResponse = JSON.parse(response.text || "{}");
+    return res.json(parsedResponse);
+  } catch (err: any) {
+    console.error("API Error in /api/cascade/chat:", err);
+    return res.status(500).json({
+      error: err.message || "An error occurred with Gemini Cascade.",
+    });
   }
 });
 
-// Initialize Vite middleware for development or Serve static files in production
-async function setupServer() {
+// Serve Vite dev server static files or production assets
+async function startServer() {
+  let viteMiddlewares: any = null;
   if (process.env.NODE_ENV !== "production") {
-    console.log("Setting up Vite server in development mode...");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
-    app.use(vite.middlewares);
+    viteMiddlewares = vite.middlewares;
+    app.use(viteMiddlewares);
   } else {
-    console.log("Serving static production files from dist...");
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
@@ -1021,9 +344,793 @@ async function setupServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const httpServer = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+
+  // Attach WebSocket connection server
+  const wss = new WebSocketServer({ server: httpServer });
+
+  // Broadcasting helper
+  function broadcast(payload: any, skipSenderWs?: WebSocket) {
+    const rawMsg = JSON.stringify(payload);
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN && client !== skipSenderWs) {
+        client.send(rawMsg);
+      }
+    });
+  }
+
+  wss.on("connection", (ws) => {
+    const clientId = Math.random().toString(36).substring(2, 10);
+    const guestUser = generateRandomUser(clientId);
+    activeUsers[clientId] = guestUser;
+
+    // Send initial join configuration stats
+    ws.send(JSON.stringify({
+      type: "sync-state",
+      clientInfo: guestUser,
+      workspace: {
+        templateId: activeProjectTemplateId,
+        files: globalFiles,
+        gitState,
+        terminalCommands,
+        activeUsers
+      }
+    }));
+
+    // Broadcast registration join alert
+    broadcast({
+      type: "user-joined",
+      user: guestUser
+    }, ws);
+
+    ws.on("message", (msg) => {
+      try {
+        const payload = JSON.parse(msg.toString());
+        
+        switch (payload.type) {
+          case "cursor-move": {
+            if (activeUsers[clientId]) {
+              activeUsers[clientId].cursor = payload.cursor;
+              broadcast({
+                type: "cursor-updated",
+                clientId,
+                cursor: payload.cursor,
+                user: activeUsers[clientId]
+              }, ws);
+            }
+            break;
+          }
+
+          case "update-file": {
+            const { path: filePath, content } = payload;
+            const file = globalFiles.find(f => f.path === filePath);
+            if (file) {
+              file.content = content;
+              broadcast({
+                type: "file-updated",
+                path: filePath,
+                content,
+                senderId: clientId
+              }, ws);
+            }
+            break;
+          }
+
+          case "add-file": {
+            const { path: filePath, content } = payload;
+            const existingIdx = globalFiles.findIndex(f => f.path === filePath);
+            const newFile = {
+              id: filePath.replace(/\//g, "-").replace(/\./g, "-"),
+              path: filePath,
+              content: content || "",
+              type: "file" as const
+            };
+
+            if (existingIdx !== -1) {
+              globalFiles[existingIdx] = newFile;
+            } else {
+              globalFiles.push(newFile);
+            }
+
+            broadcast({
+              type: "file-added",
+              file: newFile,
+              senderId: clientId
+            });
+            break;
+          }
+
+          case "delete-file": {
+            const { path: filePath } = payload;
+            globalFiles = globalFiles.filter(f => f.path !== filePath);
+            broadcast({
+              type: "file-deleted",
+              path: filePath,
+              senderId: clientId
+            });
+            break;
+          }
+
+          case "change-template": {
+            const { templateId, files } = payload;
+            activeProjectTemplateId = templateId;
+            globalFiles = files;
+            // Clear current staged git logs
+            gitState = {
+              isInitialized: false,
+              currentBranch: "main",
+              branches: ["main"],
+              commits: [] as any[],
+              staged: {} as { [path: string]: string },
+              stash: [] as any[],
+              remotes: ["origin  https://github.com/windsurf/collaborative-app.git"]
+            };
+            terminalCommands = [
+              {
+                id: Math.random().toString(),
+                input: `system --load-template ${templateId}`,
+                output: `Template changed to ${templateId} loaded successfully.\nSystem synced over websockets.\nRe-initializing virtual environment...`,
+                directory: "~",
+                timestamp: new Date().toLocaleTimeString()
+              }
+            ];
+
+            broadcast({
+              type: "template-changed",
+              templateId,
+              files: globalFiles,
+              gitState,
+              terminalCommands
+            });
+            break;
+          }
+
+          case "terminal-command": {
+            const { input } = payload;
+            // Parse and simulate beautiful Command Line outputs in Virtual Shell environment
+            const output = executeVirtualCommand(input);
+            const userString = termuxRishActive ? "shizuku@android" : (termuxRoot ? "root@termux" : "termux");
+            const promptSymbol = termuxRishActive ? "adb-sh$" : (termuxRoot ? "#" : "$");
+            const newCmd = {
+              id: Math.random().toString(36).substring(5),
+              input,
+              output,
+              directory: termuxRishActive 
+                ? `[aarch64 /sdk/33]:` 
+                : `${userString}:${gitState.isInitialized ? `~/${activeProjectTemplateId} (${gitState.currentBranch})` : `~/${activeProjectTemplateId}`} ${promptSymbol}`,
+              timestamp: new Date().toLocaleTimeString()
+            };
+            terminalCommands.push(newCmd);
+
+            broadcast({
+              type: "terminal-result",
+              command: newCmd,
+              gitState, // Send back potentially updated virtual GIT properties
+              termuxPackages,
+              termuxRoot,
+              termuxStorage,
+              termuxTheme,
+              termuxFont,
+              termuxShizukuActive,
+              termuxRishActive
+            });
+            break;
+          }
+
+          case "sync-git": {
+            gitState = payload.gitState;
+            broadcast({
+              type: "git-updated",
+              gitState
+            }, ws);
+            break;
+          }
+        }
+      } catch (err) {
+        console.error("WS error parsing message:", err);
+      }
+    });
+
+    ws.on("close", () => {
+      delete activeUsers[clientId];
+      broadcast({
+        type: "user-left",
+        clientId
+      });
+    });
   });
 }
 
-setupServer();
+// ----------------- Collaborative Virtual CLI Simulator -----------------
+function executeVirtualCommand(input: string): string {
+  const parts = input.trim().split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+
+  switch (cmd) {
+    case "clear":
+      return "CLEAR_SIGNAL";
+
+    case "help":
+      return `Windsurf Virtual Shell Platform Instructions:
+  help                             Show this tool menu.
+  git init                         Initialize visual collaborative Git repository on current branch.
+  git status                       View staged, unstaged tracked, and conflict files.
+  git add <file> or git add .      Stage changes to tracked snapshots.
+  git commit -m "<message>"      Commit staged changes.
+  git branch                       List local branches.
+  git branch <branch-name>         Create new branch.
+  git checkout <branch-name>       Switch branches (reverts and updates files automatically!).
+  git merge <branch-name>          Integrates branch modifications. Overlaps generate real conflicts!
+  git push / git pull              Push/pull snapshots from virtual server remote.
+  git stash / git stash pop        Stash your current unstaged file values.
+  npm run build                    Compiles file template into interactive live preview engine.
+  node app.js                      Executes Node app in virtual process sandbox.
+  ls                               List files in the current active folder workspace.
+
+📲 Advanced Android Emulation Shells (Termux):
+  su                               Toggle simulated superuser root privilege level
+  shizuku                          Toggle or query status of Shizuku Android Binder Services
+  rish                             Link and boot local Shizuku safe ADB shell interface env
+  sui                              Interact with Sui Magisk/KernalSU superuser controls`;
+
+    case "ls": {
+      return globalFiles.map(f => `${f.type === "directory" ? "📁" : "📄"} ${f.path.padEnd(25)}  [Size: ${f.content.length} B]`).join("\n") || "Workspace empty.";
+    }
+
+    case "node": {
+      const target = parts[1];
+      if (!target) return "Error: Specify target javascript file to execute (e.g., node app.js)";
+      const matched = globalFiles.find(f => f.path === target);
+      if (!matched) return `Error: File '${target}' not found. Try running 'ls' first.`;
+      
+      return `[Executing virtual node process: node ${target}]\n---------------------------------------\nZenith Cloud Operations Process Initialized.\nSystem: ${matched.content.length} bytes loaded.\nEnvironment: Dev Context\nStatus: Execution success without warnings.\n---------------------------------------`;
+    }
+
+    case "npm": {
+      const sub = parts[1]?.toLowerCase();
+      if (sub === "run") {
+        const action = parts[2]?.toLowerCase();
+        if (action === "build") {
+          return `> windsurf-workspace@1.4.2 build\n> build:production --trace-warnings\n\n🎨 Initializing webpack/vite compilation framework...\n✔ Checking component imports and Tailwind parsing\n✔ Successfully compiled ${globalFiles.length} modules\n✔ Bundled application in 421ms\n✨ Status: Production build fully deployed. Launching Dynamic Simulated Server!`;
+        }
+        return `Error: Unknown script '${action || ""}' specified. Try 'npm run build'`;
+      }
+      return "Error: Unsupported npm instruction. Try 'npm run build'";
+    }
+
+    case "git": {
+      const action = parts[1]?.toLowerCase();
+      if (!action) return "Error: No git command specified. Type 'help' for instructions.";
+
+      if (action === "init") {
+        if (gitState.isInitialized) {
+          return "Re-initialized existing Git repository in virtual workspace.";
+        }
+        gitState.isInitialized = true;
+        gitState.currentBranch = "main";
+        gitState.branches = ["main"];
+        gitState.commits = [];
+        gitState.staged = {};
+        
+        // Make an initial commit automatically with the current files
+        const initialSnap: { [path: string]: string } = {};
+        globalFiles.forEach(f => {
+          initialSnap[f.path] = f.content;
+        });
+
+        const initialCommit = {
+          hash: Math.random().toString(36).substring(2, 9),
+          author: "Windsurf Collaborative Team",
+          message: "Initial commit (Automatic Setup)",
+          timestamp: new Date().toLocaleString(),
+          filesSnapshot: initialSnap,
+          meta: { branch: "main" }
+        };
+        gitState.commits.push(initialCommit);
+
+        return "Initialized empty Git repository in virtual workspace.\nBranch 'main' created.\nCreated initial tracking commit capturing current files snapshot.";
+      }
+
+      if (!gitState.isInitialized) {
+        return "fatal: not a git repository (run 'git init' first)";
+      }
+
+      switch (action) {
+        case "status": {
+          const lines: string[] = [];
+          lines.push(`On branch ${gitState.currentBranch}`);
+          lines.push("Your branch is up to date with 'origin/main'.");
+          lines.push("");
+
+          // Calculate changes
+          const stagedPaths = Object.keys(gitState.staged);
+          const lastCommit = getLatestCommit(gitState.currentBranch);
+          const baseSnapshot = lastCommit ? lastCommit.filesSnapshot : {};
+
+          const modifiedButUnstaged: string[] = [];
+          const untracked: string[] = [];
+
+          globalFiles.forEach(f => {
+            const hasSnap = f.path in baseSnapshot;
+            if (!hasSnap) {
+              if (!stagedPaths.includes(f.path)) {
+                untracked.push(f.path);
+              }
+            } else if (baseSnapshot[f.path] !== f.content) {
+              if (!stagedPaths.includes(f.path)) {
+                modifiedButUnstaged.push(f.path);
+              }
+            }
+          });
+
+          if (stagedPaths.length > 0) {
+            lines.push("Changes to be committed:");
+            lines.push("  (use \"git restore --staged <file>...\" to unstage)");
+            stagedPaths.forEach(p => {
+              lines.push(`\tgreen:   staged modified: ${p}`);
+            });
+            lines.push("");
+          }
+
+          if (modifiedButUnstaged.length > 0) {
+            lines.push("Changes not staged for commit:");
+            lines.push("  (use \"git add <file>...\" to update what will be committed)");
+            modifiedButUnstaged.forEach(p => {
+              lines.push(`\tred:      modified: ${p}`);
+            });
+            lines.push("");
+          }
+
+          if (untracked.length > 0) {
+            lines.push("Untracked files:");
+            lines.push("  (use \"git add <file>...\" to include in what will be committed)");
+            untracked.forEach(p => {
+              lines.push(`\tred:      untracked: ${p}`);
+            });
+            lines.push("");
+          }
+
+          if (stagedPaths.length === 0 && modifiedButUnstaged.length === 0 && untracked.length === 0) {
+            lines.push("nothing to commit, working tree clean");
+          }
+
+          return lines.join("\n");
+        }
+
+        case "add": {
+          const fileArg = parts[2];
+          if (!fileArg) return "Nothing specified, nothing added.\nDid you mean 'git add .' ?";
+
+          const lastCommit = getLatestCommit(gitState.currentBranch);
+          const baseSnapshot = lastCommit ? lastCommit.filesSnapshot : {};
+
+          if (fileArg === "." || fileArg === "*") {
+            // Stage all files that represent modifications of existing snapshots
+            globalFiles.forEach(f => {
+              gitState.staged[f.path] = f.content;
+            });
+            return `Staged ${globalFiles.length} files successfully for tracking.`;
+          } else {
+            const matched = globalFiles.find(f => f.path === fileArg);
+            if (!matched) return `fatal: pathspec '${fileArg}' did not match any files`;
+            gitState.staged[matched.path] = matched.content;
+            return `Staged modifications for '${matched.path}' successfully.`;
+          }
+        }
+
+        case "commit": {
+          const mIdx = parts.indexOf("-m");
+          if (mIdx === -1 || !parts[mIdx + 1]) {
+            return "error: switch `m` requires a value\nusage: git commit -m \"your commit message\"";
+          }
+          
+          const message = parts.slice(mIdx + 1).join(" ").replace(/["']/g, "");
+          const stagedKeys = Object.keys(gitState.staged);
+          if (stagedKeys.length === 0) {
+            return "On branch " + gitState.currentBranch + "\nnothing to commit, working tree clean (stage changes first using 'git add .')";
+          }
+
+          // Build snapshot: start with latest commit snapshot and apply modifications from files
+          const lastCommit = getLatestCommit(gitState.currentBranch);
+          const defaultSnap = lastCommit ? { ...lastCommit.filesSnapshot } : {};
+          
+          // Apply staged changes
+          globalFiles.forEach(f => {
+            if (f.path in gitState.staged) {
+              defaultSnap[f.path] = gitState.staged[f.path];
+            }
+          });
+
+          const newCommit = {
+            hash: Math.random().toString(36).substring(2, 9),
+            author: "Anonymous Git Contributor",
+            message,
+            timestamp: new Date().toLocaleTimeString() + " " + new Date().toLocaleDateString(),
+            filesSnapshot: defaultSnap,
+            meta: {
+              branch: gitState.currentBranch,
+              parent: lastCommit ? lastCommit.hash : undefined
+            }
+          };
+
+          gitState.commits.push(newCommit);
+          gitState.staged = {}; // Flush staged area
+
+          return `[${gitState.currentBranch} ${newCommit.hash}] ${message}\n ${stagedKeys.length} files changed, staging successfully flushed.`;
+        }
+
+        case "branch": {
+          const branchArg = parts[2];
+          if (!branchArg) {
+            // List branches
+            return gitState.branches.map(b => b === gitState.currentBranch ? `* ${b}` : `  ${b}`).join("\n");
+          }
+
+          if (gitState.branches.includes(branchArg)) {
+            return `fatal: A branch named '${branchArg}' already exists.`;
+          }
+
+          gitState.branches.push(branchArg);
+          return `Branch '${branchArg}' spawned stemming from HEAD of '${gitState.currentBranch}'.`;
+        }
+
+        case "checkout": {
+          const branchArg = parts[2];
+          if (!branchArg) return "Error: Branch destination not specified (e.g., git checkout <branch-name>)";
+
+          if (branchArg === "-b" && parts[3]) {
+            const newBranch = parts[3];
+            if (gitState.branches.includes(newBranch)) {
+              return `fatal: A branch named '${newBranch}' already exists.`;
+            }
+            gitState.branches.push(newBranch);
+            gitState.currentBranch = newBranch;
+            return `Switched to a new branch '${newBranch}'`;
+          }
+
+          if (!gitState.branches.includes(branchArg)) {
+            return `error: pathspec '${branchArg}' did not match any branch known to git`;
+          }
+
+          // SWAP ACTIVE FILE CONTENTS TO CHOSEN BRANCH'S LATEST SNAPSHOT!
+          gitState.currentBranch = branchArg;
+          const targetCommit = getLatestCommit(branchArg);
+          if (targetCommit) {
+            const snapshot = targetCommit.filesSnapshot;
+            // Overwrite memory file array properties
+            Object.keys(snapshot).forEach(filepath => {
+              const matched = globalFiles.find(f => f.path === filepath);
+              if (matched) {
+                matched.content = snapshot[filepath];
+              } else {
+                globalFiles.push({
+                  id: filepath.replace(/\//g, "-").replace(/\./g, "-"),
+                  path: filepath,
+                  type: "file",
+                  content: snapshot[filepath]
+                });
+              }
+            });
+            return `Switched to branch '${branchArg}'\nVirtual filesystem updated dynamically to this branch's HEAD commit: [Commit Hash: ${targetCommit.hash}]`;
+          }
+
+          return `Switched to branch '${branchArg}'\n[Warning: No commits found, working environment state retained]`;
+        }
+
+        case "merge": {
+          const branchArg = parts[2];
+          if (!branchArg) return "Error: Target merge source branch not specified (e.g., git merge <branch-name>)";
+
+          if (branchArg === gitState.currentBranch) {
+            return "Already up to date. Cannot merge self.";
+          }
+
+          if (!gitState.branches.includes(branchArg)) {
+            return `fatal: '${branchArg}' branch not found.`;
+          }
+
+          const currentHEAD = getLatestCommit(gitState.currentBranch);
+          const mergeHEAD = getLatestCommit(branchArg);
+
+          if (!mergeHEAD) {
+            return `No commits on target branch '${branchArg}' to merge.`;
+          }
+
+          if (!currentHEAD) {
+            gitState.commits.push({
+              hash: Math.random().toString(36).substring(2, 9),
+              author: "Merge Helper",
+              message: `Merge branch '${branchArg}' into empty branch`,
+              timestamp: new Date().toLocaleString(),
+              filesSnapshot: { ...mergeHEAD.filesSnapshot },
+              meta: { branch: gitState.currentBranch }
+            });
+            // Update workspace content
+            Object.keys(mergeHEAD.filesSnapshot).forEach(pt => {
+              const rootFile = globalFiles.find(f => f.path === pt);
+              if (rootFile) rootFile.content = mergeHEAD.filesSnapshot[pt];
+            });
+            return `Fast-forward: Integrated all files successfully.`;
+          }
+
+          // Merge analysis! Look for content changes on both sides.
+          let hasConflict = false;
+          const mergedSnapshot = { ...currentHEAD.filesSnapshot };
+          const loggedConfFiles: string[] = [];
+
+          Object.keys(mergeHEAD.filesSnapshot).forEach(pathKey => {
+            const destinationContent = currentHEAD.filesSnapshot[pathKey];
+            const sourceContent = mergeHEAD.filesSnapshot[pathKey];
+
+            if (destinationContent !== undefined && sourceContent !== undefined && destinationContent !== sourceContent) {
+              // CONFLICT TRIGGERED! Insert actual Git style merge boundaries so users can resolve online!
+              hasConflict = true;
+              loggedConfFiles.push(pathKey);
+
+              const conflictMarkerText = `<<<<<<< HEAD (Current Branch: ${gitState.currentBranch})\n${destinationContent}\n=======\n${sourceContent}\n>>>>>>> MERGE_SRC (Incoming Branch: ${branchArg})`;
+              
+              mergedSnapshot[pathKey] = conflictMarkerText;
+
+              // Overwrite in-memory file content
+              const matchedF = globalFiles.find(f => f.path === pathKey);
+              if (matchedF) {
+                matchedF.content = conflictMarkerText;
+              }
+            } else {
+              mergedSnapshot[pathKey] = sourceContent;
+            }
+          });
+
+          if (hasConflict) {
+            return `❗ AUTOMATIC MERGE CONFLICT DETECTED IN:\n${loggedConfFiles.map(f => `  ->  ${f}`).join("\n")}\n\nUnmerged paths exist in your files.\nConflict tags injected successfully directly inside standard editor fields.\nResolving instruction: Review changes, strip Git tags and execute 'git add .' and 'git commit -m "Merge branch resolved"'.`;
+          }
+
+          // Otherwise, clean merge commit
+          const cleanMergeCommit = {
+            hash: Math.random().toString(36).substring(2, 9),
+            author: "Automated Git Merger",
+            message: `Merge branch '${branchArg}' into '${gitState.currentBranch}'`,
+            timestamp: new Date().toLocaleString(),
+            filesSnapshot: mergedSnapshot,
+            meta: { branch: gitState.currentBranch }
+          };
+
+          gitState.commits.push(cleanMergeCommit);
+          // Apply changes to workspace
+          Object.keys(mergedSnapshot).forEach(pt => {
+            const fl = globalFiles.find(f => f.path === pt);
+            if (fl) fl.content = mergedSnapshot[pt];
+          });
+
+          return `Updating commit index... [Merge complete!]\nBranch '${branchArg}' integrated into '${gitState.currentBranch}' successfully without conflicts.\n HEAD is now pointing to commit ${cleanMergeCommit.hash}`;
+        }
+
+        case "push": {
+          return `Connecting to cloud git service remote...\n🔐 Handshaking authentication...\n✔ Writing git pack file...\n📦 Uploaded [HEAD -> refs/heads/${gitState.currentBranch}] to upstream repository.\nSynchronized successfully! All contributors updated.`;
+        }
+
+        case "pull": {
+          return `Fetching latest updates from remote origin server...\nAuthorized. Branch ${gitState.currentBranch} is already matching origin heads.\nNo downstream modifications fetched.`;
+        }
+
+        case "stash": {
+          const subcommand = parts[2]?.toLowerCase();
+          if (subcommand === "pop") {
+            if (gitState.stash.length === 0) {
+              return "No stashed values index found to re-apply.";
+            }
+            const popped = gitState.stash.pop();
+            Object.keys(popped.files).forEach(pt => {
+              const fle = globalFiles.find(f => f.path === pt);
+              if (fle) fle.content = popped.files[pt];
+            });
+            return `Dropped refs/stash@{0} - Applied stashed changes: "${popped.msg}"`;
+          }
+
+          // Create standard stash
+          const cachedFiles: { [path: string]: string } = {};
+          globalFiles.forEach(f => {
+            cachedFiles[f.path] = f.content;
+          });
+          gitState.stash.push({
+            id: `stash-${Math.random()}`,
+            msg: parts.slice(2).join(" ") || `Stashed changes on branch ${gitState.currentBranch}`,
+            files: cachedFiles
+          });
+          return `Saved working directory state to refs/stash@{${gitState.stash.length - 1}}\nReady.`;
+        }
+
+        case "log": {
+          if (gitState.commits.length === 0) {
+            return "No commit histories found.";
+          }
+          return gitState.commits
+            .slice()
+            .reverse()
+            .map(c => `green:commit ${c.hash}\nAuthor: ${c.author}\nDate:   ${c.timestamp}\n\n    ${c.message}\n`)
+            .join("\n");
+        }
+
+        default:
+          return `Unknown git instruction '${action}'. Try 'git status', 'git log', 'git add', 'git commit', or 'help'`;
+      }
+    }
+
+    case "su": {
+      termuxRoot = !termuxRoot;
+      return termuxRoot 
+        ? "Access granted. Simulated root permissions loaded.\nroot@termux:~#" 
+        : "Returned to standard client level permissions.\nlocalhost:~$";
+    }
+
+    case "pkg":
+    case "apt": {
+      const subcommand = parts[1]?.toLowerCase();
+      if (!subcommand) {
+        return "apt/pkg Package Manager Suite:\n  pkg list-installed\n  pkg install <package>\n  pkg uninstall <package>";
+      }
+      if (subcommand === "list-installed" || subcommand === "list") {
+        return `Installed packages across simulated Android repositories:\n${termuxPackages.map(p => ` - ${p}/stable,now 1.25.0 [installed]`).join("\n")}`;
+      }
+      if (subcommand === "install") {
+        const pkgName = parts[2]?.toLowerCase();
+        if (!pkgName) return "fatal: Specify package name to build/install (e.g. pkg install python)";
+        if (termuxPackages.includes(pkgName)) {
+          return `Package ${pkgName} is already satisfied inside stable repository path.`;
+        }
+        termuxPackages.push(pkgName);
+        return `Retrieving repository updates...\nUnpacking package: aarch64/${pkgName}...\nSetting up ${pkgName} (v1.2.0-stable)...\n✔ Installation completed successfully!`;
+      }
+      if (subcommand === "uninstall" || subcommand === "remove") {
+        const pkgName = parts[2]?.toLowerCase();
+        if (!pkgName) return "fatal: Specify package name to uninstall";
+        if (!termuxPackages.includes(pkgName)) {
+          return `Package ${pkgName} not found or not currently installed.`;
+        }
+        termuxPackages = termuxPackages.filter(p => p !== pkgName);
+        return `Removing ${pkgName} packages configuration index...\nPurging file configurations...\n✔ Package successfully uninstalled.`;
+      }
+      return `sh: apt/pkg: option '${subcommand}' is currently unrecognized.`;
+    }
+
+    case "termux-setup-storage": {
+      termuxStorage = true;
+      return "Requesting Android Storage Write Access Permissions (REQUEST_CODE_WRITE_EXTERNAL_STORAGE)...\n✔ Success. Symlinked sandbox directories inside: /storage/emulated/0/DCIM /sdcard/Workspace";
+    }
+
+    case "termux-battery-status": {
+      return "{\n  \"health\": \"GOOD\",\n  \"percentage\": 94,\n  \"plugged\": \"PLUGGED_AC\",\n  \"status\": \"CHARGING\",\n  \"temperature\": 29.4,\n  \"type\": \"Li-poly\"\n}";
+    }
+
+    case "termux-vibrate": {
+      const waitTime = parts[1] || "300";
+      return `TERMUX_API:VIBRATE:${waitTime}\n[Device Motor Engine Action]: Vibrated for ${waitTime}ms.`;
+    }
+
+    case "termux-toast": {
+      const message = parts.slice(1).join(" ") || "Interactive Termux API notification Triggered!";
+      return `TERMUX_API:TOAST:${message}\n[Simulated Alert Popup]: displayed: "${message}"`;
+    }
+
+    case "termux-styling": {
+      const subcommand = parts[1]?.toLowerCase();
+      const val = parts[2]?.toLowerCase();
+      if (subcommand === "theme" && val) {
+        termuxTheme = val;
+        return `TERMUX_API:STYLE_THEME:${val}\nConsole visual palette applied: [${val}]`;
+      }
+      return "Styling utility commands:\n  termux-styling theme <dracula|monokai|solarized|nord|retro-green|cobalt|matrix>";
+    }
+
+    case "termux-info": {
+      return `Upstream build info tracker:\n-------------------------------------\nApplication: Termux Android Emulation client\nEnvironment: Antigravity Node Sandbox\nShell: bash v5.2\nAPI Platform Level: 33\nPackages count: ${termuxPackages.length}\n-------------------------------------`;
+    }
+
+    case "uname": {
+      const flag = parts[1];
+      if (flag === "-a") {
+        return "Linux localhost 5.15.0-88-generic #98-Ubuntu SMP aarch64 Android API 33";
+      }
+      return "Linux";
+    }
+
+    case "shizuku": {
+      const subcommand = parts[1]?.toLowerCase();
+      if (!subcommand || subcommand === "status") {
+        if (!termuxShizukuActive) {
+          return "Shizuku Manager Service Info:\n-------------------------------------------\nStatus: STOPPED\nService Port: offline\nType 'shizuku start' to reboot Shizuku daemon process.";
+        }
+        return `Shizuku Manager Service Info:
+-------------------------------------------
+Status: RUNNING (as system service via ADB port 5555)
+Active Mode: ADB (Wireless Debugging authorized)
+Version: v13.5.4.r1024
+Binder Socket: bound (/dev/shizuku_ipc)
+Authorized Apps: Termux (uid=10287)
+
+To activate an ADB Shell, type 'rish'!`;
+      }
+      if (subcommand === "start") {
+        termuxShizukuActive = true;
+        return "Spawning Shizuku system daemon process...\nBinding IPC client to /dev/shizuku_ipc...\n✔ Shizuku service successfully started and listening on ADB port 5555.";
+      }
+      if (subcommand === "stop") {
+        termuxShizukuActive = false;
+        termuxRishActive = false;
+        return "🛑 Stopping Shizuku binder daemon...\nUnbinding Termux IPC ports...\n✔ Shizuku service successfully terminated.";
+      }
+      return `sh: shizuku: option '${subcommand}' unrecognized.`;
+    }
+
+    case "rish": {
+      if (!termuxShizukuActive) {
+        return "rish: fatal: Shizuku binder service is not running. Type 'shizuku start' first.";
+      }
+      termuxRishActive = true;
+      return `Initializing secure Shizuku 'rish' binder socket connection...
+Resolving target binder descriptor: android.os.IUserService
+✔ Binder token handshake completed successfully.
+✔ Elevated ADB access context granted (uid=2000, shell permissions).
+
+Welcome to Android ADB shell (aarch64 rish terminal)!
+Run commands under privileged security profiles.
+Type 'exit' to terminate this rish adb session.`;
+    }
+
+    case "sui": {
+      const subcommand = parts[1]?.toLowerCase();
+      if (!subcommand) {
+        return `Sui: Privileged Superuser controller over Shizuku:
+--------------------------------------------
+Sui provides Magisk/KernelSU root permission compliance on modern Android levels.
+Commands:
+  sui request     Request Superuser permission popup
+  sui status      Check Magisk/KernelSU connection table`;
+      }
+      if (subcommand === "request") {
+        if (!termuxShizukuActive) {
+          return "sui: Shizuku service offline. Sui requires an active Shizuku backend to run binder requests.";
+        }
+        return "sui: Summoning Magisk/KernelSU Superuser Permission popup on Android Screen...\n✔ Permission GRANTED! Superuser clearance successfully enabled for Unix UID 10287.\nYou can now type 'su' to switch to root shell mode.";
+      }
+      if (subcommand === "status") {
+        return `Sui Security Compliance Check:
+--------------------------------------------
+Magisk Core Version: v26.4 (MagiskSU compliance)
+Sui Client Version: v13.5.4
+Target App: com.termux (authorized)
+Clearance: root capabilities simulated successfully.`;
+      }
+      return `sh: sui: option '${subcommand}' is recognized but cannot be executed.`;
+    }
+
+    case "exit": {
+      if (termuxRishActive) {
+        termuxRishActive = false;
+        return "Terminated active rish ADB shell environment.\nReturned back to default bash shell: localhost:~$";
+      }
+      if (termuxRoot) {
+        termuxRoot = false;
+        return "Logging out of superuser root namespace.\nReturned to standard system client: localhost:~$";
+      }
+      return "Terminal session requested closed. Re-opening shell console process...";
+    }
+
+    default:
+      return `sh: command not found: ${cmd}. Type 'help' to review simulated core functions.`;
+  }
+}
+
+function getLatestCommit(branch: string) {
+  // Find latest commit that was generated either under or inherited by the target branch
+  const match = gitState.commits.filter(c => c.meta?.branch === branch);
+  if (match.length > 0) {
+    return match[match.length - 1];
+  }
+  // Try fallback to main commit
+  return gitState.commits.find(c => c.meta?.branch === "main") || gitState.commits[0];
+}
+
+startServer();
